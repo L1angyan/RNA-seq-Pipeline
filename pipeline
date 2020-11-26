@@ -1,0 +1,92 @@
+module load hisat2/2.2.0
+extract_exons.py chrX.gtf > chrX.exon
+extract_splice_sites.py chrX.gtf > chrX.ss
+hisat2-build -p 10 chrX.fa --ss chrX.ss --exon chrX.exon chrX_tran
+#提取外显子，剪切位点，并建立索引
+
+#batch1.sh代码
+module load hisat2/2.2.0
+module load StringTie/1.3.0-foss-2016b
+module load SAMtools/1.9
+
+for i in *1.fastq.gz;do
+name=${i%_chr*}
+fq1=${i%_*}_1.fastq.gz
+fq2=${i%_*}_2.fastq.gz
+sam=${name}.sam
+bam=${name}_sorted.bam
+gtf=${name}.gtf
+
+bsub -J $name -n 10 -R span[hosts=1] -o %J.out -e %J.err -q q2680v2 \
+"hisat2 -p 10 --dta -x ../genome/chrX_tran -1 $fq1 -2 $fq2 -S $sam; \
+samtools view -@ 5 -bS -F 4 -F 256 $sam|samtools sort -@ 5 -m 4G -o $bam; \
+stringtie $bam -p 10 -G ../genome/chrX.gtf -o ./$gtf; \
+"
+done
+
+#batch2.sh代码
+module load StringTie/1.3.0-foss-2016b
+for i in *.gtf
+echo $i >> mergelist.txt
+done
+bsub -J merge -n 10 -R span[hosts=1] -o %J.out -e %J.err -q q2680v2 \
+"stringtie --merge -p 10 -G ../genome/chrX.gtf -o stringtie_merged.gtf mergelist.txt; \
+sh batch3.sh" 
+#自动运行第三个脚本
+
+#batch3.sh代码
+module load StringTie/1.3.0-foss-2016b
+
+for i in ERR*gtf;do
+name=${i%.gtf}
+bam=${name}_sorted.bam
+mkdir ./${name}
+bsub -J quantify -n 10 -R span[hosts=1] -o %J.out -e %J.err -q q2680v2 \
+"stringtie -e -G ./stringtie_merged.gtf -p 10-B -o ./$name/${name}_merge.gtf -A ./$name/${name}_merge.txt $bam"
+done
+
+#下一步：用stringtie给的脚本得到reads count
+for i in E*;do
+echo $i ./$i/${i}_merge.gtf >> sample_list.txt
+done
+#生成sample_list.txt，第一列为样本名，第二列为其生成的gtf文件的路径
+python prepDE.py -i sample_list.txt -g gene.csv -t transcript.csv
+#gene.csv基因的reads count，transcript.csv同理
+
+#差异表达分析
+module load R/3.6.0
+BiocManager::install("DESeq2")  #安装DESeq2包
+library(DESeq2)
+
+db = read.csv("gene.csv", header = TRUE, row.names = 1)
+db = round(as.matrix(db))       #round函数四舍六入五留双
+phe = read.csv("../geuvadis_phenodata.csv",head=T)
+condition=phe$sex               #因为是性别之间的差异分析，去除性别作为因子变量
+coldata = data.frame(row.names=colnames(db),condition)  #表型数据框
+
+dds=DESeqDataSetFromMatrix(countData=db,colData=coldata, design=~condition)
+dds2 = DESeq(dds)               #均一化normalization
+resultsNames(dds2)              #查看结果的名称
+res=results(dds2)               #results函数获取结果并赋值给res
+head(res)                       #查看res的前六行
+mcols(res,use.names= TRUE)      # 查看res矩阵每一列的含义
+table(res$padj<0.05)            #table函数，统计某个值的counts数
+res=res[order(res$padj),]       #按照padj的大小进行排序
+                                #order函数输出的是从小到大的元素的位置索引
+                                #a = c(3,7,1,4,2,6,5)
+                                #order(a)
+                                #[1] 3 5 1 4 7 6 2
+
+diff_gene_deseq2=subset(res,padj<0.05&(log2FoldChange >1 | log2FoldChange < -1))
+                                #获取padj小于0.05，表达倍数取log2后,
+                                #绝对值大于1的基因作为差异表达基因
+                                #得到的数据框包含表达基因的results
+head (diff_gene_deseq2, n=5)    #查看diff_gene_deseq2矩阵的前5行
+diff_gene_deseq2=row.names(diff_gene_deseq2)
+                                #提取diff_gene_deseq2的行名
+                                #共有17个基因在male和female间差异表达
+resdata=merge(as.data.frame(res),\
+as.data.frame(counts(dds2,normalize=TRUE)),\
+by="row.names",sort=FALSE)      #加上均一化后的counts数
+write.csv(resdata,file="male_vs_female.csv")
+                                #写出结果
